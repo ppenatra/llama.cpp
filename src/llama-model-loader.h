@@ -92,8 +92,9 @@ struct llama_model_loader {
 
     llama_mmaps mappings;
 
-    // byte ranges of TENSOR_READ_LAZY tensors, per file index
-    std::map<uint32_t, llama_mmap::ranges> lazy_tensor_ranges;
+    // byte ranges, per source file, that init_mappings() must not pull in eagerly: gather tables
+    // the model reads a few percent of. set under LLAMA_MMAP_RANDOM only, sorted by offset.
+    std::map<uint16_t, std::vector<std::pair<size_t, size_t>>> mmap_no_prefetch;
 
     std::map<std::string, llama_tensor_weight, weight_name_comparer> weights_map;
     std::unordered_map<std::string, llama_model_kv_override> kv_overrides;
