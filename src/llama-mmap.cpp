@@ -5,9 +5,7 @@
 #include "ggml.h"
 
 #include <cstring>
-#include <cstdlib>
 #include <climits>
-#include <vector>
 #include <stdexcept>
 #include <cerrno>
 #include <algorithm>
@@ -441,6 +439,7 @@ void llama_file::write_u32(uint32_t val) const { pimpl->write_u32(val); }
 // llama_mmap
 
 <<<<<<< HEAD
+<<<<<<< HEAD
 #if defined(_POSIX_MAPPED_FILES) || defined(_WIN32)
 // merge `ranges` and return their complement within [0, limit)
 static llama_mmap::ranges ranges_complement(llama_mmap::ranges ranges, size_t limit) {
@@ -543,7 +542,6 @@ struct llama_mmap::impl {
     impl(struct llama_file * file, size_t prefetch, bool numa, const llama_mmap::ranges & lazy_ranges) {
         size = file->size();
         int fd = file->file_id();
-        fd_advise = fd;
         int flags = MAP_SHARED;
         if (numa) { prefetch = 0; }
 #ifdef __linux__
@@ -588,82 +586,6 @@ struct llama_mmap::impl {
         }
 
         mapped_fragments.emplace_back(0, file->size());
-    }
-
-    // load streams the file once, so it asks for POSIX_FADV_SEQUENTIAL
-    // sparse gathers want the opposite: readahead buys nothing and costs page cache
-    // so flip the advice after load, over this range only
-    void advise_random_range(size_t offset, size_t len, bool drop) {
-        if (offset >= size || len == 0) {
-            return;
-        }
-        len = std::min(len, size - offset);
-
-        // madvise needs an aligned start and rounds the length up, so round both out
-        // this can take in one page of the neighbour on each side
-        const size_t page  = llama_mmap_page_size();
-        const size_t first = offset & ~(page - 1);
-        const size_t last  = std::min(size, (offset + len + page - 1) & ~(page - 1));
-
-#if defined(__linux__)
-        if (drop) {
-            // on a shared file map this only tears down our page tables
-            if (madvise((char *) addr + first, last - first, MADV_DONTNEED)) {
-                LLAMA_LOG_WARN("warning: madvise(.., MADV_DONTNEED) failed: %s\n", strerror(errno));
-            }
-            // this frees the page cache; it spares partial pages, so a neighbour on the end page keeps its own
-            if (fd_advise >= 0 && posix_fadvise(fd_advise, (off_t) offset, (off_t) len, POSIX_FADV_DONTNEED)) {
-                LLAMA_LOG_WARN("warning: posix_fadvise(.., POSIX_FADV_DONTNEED) failed: %s\n", strerror(errno));
-            }
-        }
-#else
-        GGML_UNUSED(drop);
-#endif
-        // no POSIX_FADV_RANDOM here: it marks the whole file, and its FMODE_RANDOM only affects read(), not faults
-        if (posix_madvise((char *) addr + first, last - first, POSIX_MADV_RANDOM)) {
-            LLAMA_LOG_WARN("warning: posix_madvise(.., POSIX_MADV_RANDOM) failed: %s\n", strerror(errno));
-        }
-    }
-
-    void prefetch_except(const std::vector<std::pair<size_t, size_t>> & skip) {
-        const size_t page = llama_mmap_page_size();
-
-        size_t pos = 0;
-        for (const auto & [off, len] : skip) {
-            const size_t first = off & ~(page - 1);
-            if (first > pos) {
-                prefetch_range(pos, first - pos);
-            }
-            pos = std::max(pos, std::min(size, (off + len + page - 1) & ~(page - 1)));
-        }
-        if (pos < size) {
-            prefetch_range(pos, size - pos);
-        }
-    }
-
-    void prefetch_range(size_t offset, size_t len) const {
-        if (posix_madvise((char *) addr + offset, len, POSIX_MADV_WILLNEED)) {
-            LLAMA_LOG_WARN("warning: posix_madvise(.., POSIX_MADV_WILLNEED) failed: %s\n", strerror(errno));
-        }
-    }
-
-    void prefetch_rows(const void * base, size_t stride, size_t row_size,
-                       const int32_t * rows, size_t n_rows) const {
-#if defined(_POSIX_MAPPED_FILES)
-        const size_t base_off = (const char *) base - (const char *) addr;
-
-        for (const auto & [off, len] : llama_mmap_row_pages(
-                    base_off, stride, row_size, size, rows, n_rows, llama_mmap_page_size())) {
-            // unchecked on purpose: thousands of hints per batch, and a failed one only costs the fault it would have saved
-            posix_madvise((char *) addr + off, len, POSIX_MADV_WILLNEED);
-        }
-#else
-        GGML_UNUSED(base);
-        GGML_UNUSED(stride);
-        GGML_UNUSED(row_size);
-        GGML_UNUSED(rows);
-        GGML_UNUSED(n_rows);
-#endif
     }
 
     static void align_range(size_t * first, size_t * last, size_t page_size) {
@@ -778,90 +700,6 @@ struct llama_mmap::impl {
         GGML_UNUSED(last);
     }
 
-    // Windows has no "read this range randomly" hint; not pulling the range in is what keeps the pages out
-    void advise_random_range(size_t offset, size_t len, bool drop) {
-        GGML_UNUSED(offset);
-        GGML_UNUSED(len);
-        GGML_UNUSED(drop);
-    }
-
-    void prefetch_except(const std::vector<std::pair<size_t, size_t>> & skip) {
-#if _WIN32_WINNT >= 0x602
-        BOOL (WINAPI *pPrefetchVirtualMemory) (HANDLE, ULONG_PTR, PWIN32_MEMORY_RANGE_ENTRY, ULONG);
-        HMODULE hKernel32 = GetModuleHandleW(L"kernel32.dll");
-
-        pPrefetchVirtualMemory = (decltype(pPrefetchVirtualMemory))(void *) GetProcAddress(hKernel32, "PrefetchVirtualMemory");
-        if (!pPrefetchVirtualMemory) {
-            return;
-        }
-
-        const size_t page = llama_mmap_page_size();
-
-        std::vector<WIN32_MEMORY_RANGE_ENTRY> entries;
-        size_t pos = 0;
-        for (const auto & [off, len] : skip) {
-            const size_t first = off & ~(page - 1);
-            if (first > pos) {
-                WIN32_MEMORY_RANGE_ENTRY e;
-                e.VirtualAddress = (char *) addr + pos;
-                e.NumberOfBytes  = (SIZE_T) (first - pos);
-                entries.push_back(e);
-            }
-            pos = std::max(pos, std::min(size, (off + len + page - 1) & ~(page - 1)));
-        }
-        if (pos < size) {
-            WIN32_MEMORY_RANGE_ENTRY e;
-            e.VirtualAddress = (char *) addr + pos;
-            e.NumberOfBytes  = (SIZE_T) (size - pos);
-            entries.push_back(e);
-        }
-
-        if (!entries.empty() && !pPrefetchVirtualMemory(GetCurrentProcess(), (ULONG_PTR) entries.size(), entries.data(), 0)) {
-            LLAMA_LOG_WARN("warning: PrefetchVirtualMemory failed: %s\n",
-                    llama_format_win_err(GetLastError()).c_str());
-        }
-#else
-        GGML_UNUSED(skip);
-        LLAMA_LOG_DEBUG("skipping PrefetchVirtualMemory because _WIN32_WINNT < 0x602\n");
-#endif
-    }
-
-    // PrefetchVirtualMemory takes every range in one call, so the reads go out together instead of one fault at a time
-    void prefetch_rows(const void * base, size_t stride, size_t row_size,
-                       const int32_t * rows, size_t n_rows) const {
-#if _WIN32_WINNT >= 0x602
-        BOOL (WINAPI *pPrefetchVirtualMemory) (HANDLE, ULONG_PTR, PWIN32_MEMORY_RANGE_ENTRY, ULONG);
-        HMODULE hKernel32 = GetModuleHandleW(L"kernel32.dll");
-
-        pPrefetchVirtualMemory = (decltype(pPrefetchVirtualMemory))(void *) GetProcAddress(hKernel32, "PrefetchVirtualMemory");
-        if (!pPrefetchVirtualMemory) {
-            return;
-        }
-
-        const size_t base_off = (const char *) base - (const char *) addr;
-
-        std::vector<WIN32_MEMORY_RANGE_ENTRY> entries;
-        for (const auto & [off, len] : llama_mmap_row_pages(
-                    base_off, stride, row_size, size, rows, n_rows, llama_mmap_page_size())) {
-            WIN32_MEMORY_RANGE_ENTRY e;
-            e.VirtualAddress = (char *) addr + off;
-            e.NumberOfBytes  = (SIZE_T) len;
-            entries.push_back(e);
-        }
-
-        if (!entries.empty()) {
-            // unchecked for the same reason as the POSIX branch: it is only a hint
-            pPrefetchVirtualMemory(GetCurrentProcess(), (ULONG_PTR) entries.size(), entries.data(), 0);
-        }
-#else
-        GGML_UNUSED(base);
-        GGML_UNUSED(stride);
-        GGML_UNUSED(row_size);
-        GGML_UNUSED(rows);
-        GGML_UNUSED(n_rows);
-#endif
-    }
-
     ~impl() {
         if (hMapping) {
             if (addr) {
@@ -892,45 +730,10 @@ struct llama_mmap::impl {
 
         throw std::runtime_error("mmap not supported");
     }
-
-    void advise_random_range(size_t offset, size_t len, bool drop) {
-        GGML_UNUSED(offset);
-        GGML_UNUSED(len);
-        GGML_UNUSED(drop);
-
-        throw std::runtime_error("mmap not supported");
-    }
-
-    void prefetch_except(const std::vector<std::pair<size_t, size_t>> & skip) {
-        GGML_UNUSED(skip);
-
-        throw std::runtime_error("mmap not supported");
-    }
-
-    void prefetch_rows(const void * base, size_t stride, size_t row_size,
-                       const int32_t * rows, size_t n_rows) const {
-        GGML_UNUSED(base);
-        GGML_UNUSED(stride);
-        GGML_UNUSED(row_size);
-        GGML_UNUSED(rows);
-        GGML_UNUSED(n_rows);
-
-        throw std::runtime_error("mmap not supported");
-    }
 #endif
-
-    bool contains(const void * ptr, size_t len) const {
-        const char * p = (const char *) ptr;
-        const char * b = (const char *) addr;
-
-        return p >= b && len <= size && (size_t) (p - b) <= size - len;
-    }
 
     void * addr;
     size_t size;
-
-    // the fd is kept only to re-advise the file; the mapping owns no reference to it
-    int fd_advise = -1;
 };
 
 llama_mmap::llama_mmap(struct llama_file * file, size_t prefetch, bool numa,
@@ -941,21 +744,6 @@ size_t llama_mmap::size() const { return pimpl->size; }
 void * llama_mmap::addr() const { return pimpl->addr; }
 
 void llama_mmap::unmap_fragment(size_t first, size_t last) { pimpl->unmap_fragment(first, last); }
-
-void llama_mmap::advise_random_range(size_t offset, size_t len, bool drop) {
-    pimpl->advise_random_range(offset, len, drop);
-}
-
-void llama_mmap::prefetch_except(const std::vector<std::pair<size_t, size_t>> & skip) {
-    pimpl->prefetch_except(skip);
-}
-
-bool llama_mmap::contains(const void * ptr, size_t len) const { return pimpl->contains(ptr, len); }
-
-void llama_mmap::prefetch_rows(const void * base, size_t stride, size_t row_size,
-                               const int32_t * rows, size_t n_rows) const {
-    pimpl->prefetch_rows(base, stride, row_size, rows, n_rows);
-}
 
 #if defined(_POSIX_MEMLOCK_RANGE) || defined(_WIN32)
 const bool llama_mmap::SUPPORTED  = true;
